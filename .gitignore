@@ -1,6 +1,7 @@
 .vs/*
 
-projects/H_Ethernet/obj/*
-projects/H_Ethernet/bin/*
+projects/Communication/obj/*
+projects/Communication/bin/*
 
-
+projects/Test/obj/*
+projects/Test/bin/*

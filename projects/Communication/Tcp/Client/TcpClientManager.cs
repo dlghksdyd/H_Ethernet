@@ -1,18 +1,16 @@
-﻿
+﻿using System.Collections.Concurrent;
 
-using System.Collections.Concurrent;
-
-namespace H_Ethernet.Client
+namespace Communication.Tcp.Client
 {
-    public static class EthernetClientManager
+    public static class TcpClientManager
     {
-        private static readonly ConcurrentDictionary<Guid, EthernetClient> _clients = new();
+        private static readonly ConcurrentDictionary<Guid, TcpClient> _clients = new();
 
-        public static EthernetClient Create(EthernetClientOptions options)
+        public static TcpClient Create(TcpClientOptions options)
         {
             if (options is null) throw new ArgumentNullException(nameof(options));
 
-            var client = EthernetClient.CreateInternal(options);
+            var client = TcpClient.CreateInternal(options);
 
             if (!_clients.TryAdd(client.Guid, client))
             {
@@ -23,7 +21,7 @@ namespace H_Ethernet.Client
             return client;
         }
 
-        public static void Dispose(EthernetClient client)
+        public static void Dispose(TcpClient client)
         {
             if (client == null) throw new ArgumentNullException(nameof(client));
 
