@@ -7,7 +7,6 @@ namespace Communication.Tcp.Server
 {
     /// <summary>
     /// 비동기 TCP 서버. 연결/해제/수신 이벤트 제공, 개별 송신/브로드캐스트 지원.
-    /// 클라이언트의 구조/패턴과 대칭되도록 구성됨.
     /// </summary>
     public sealed class TcpServer
     {
@@ -72,6 +71,7 @@ namespace Communication.Tcp.Server
                 ClientConnected?.Invoke(this, new ClientEventArgs(client));
             } catch { /* ignored */ }
         }
+
         private void RaiseClientDisconnected(ClientContext ctx)
         {
             try
@@ -131,8 +131,6 @@ namespace Communication.Tcp.Server
                     CloseSocketSafe(ctx.Socket);
                 }
             }
-
-            GC.SuppressFinalize(this);
         }
 
         private void ThrowIfDisposed()
