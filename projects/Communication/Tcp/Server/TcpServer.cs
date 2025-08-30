@@ -1,11 +1,13 @@
 ﻿using System;
 using System.Buffers;
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Linq;
 
 namespace Communication.Tcp.Server
 {
@@ -23,82 +25,115 @@ namespace Communication.Tcp.Server
 
         // 리스너 및 제어
         private Socket? _listener;
-        private CancellationTokenSource? _acceptCts;
-        private Task? _acceptTask;
 
         // 시작/중지 동시성 제어
         private readonly SemaphoreSlim _startStopLock = new(1, 1);
 
-        // 세션들
-        private readonly ConcurrentDictionary<Guid, ClientSession> _sessions = new();
+        // Accept 루프 제어
+        private CancellationTokenSource? _acceptCts;
+        private Task? _acceptTask;
 
-        // 이벤트
-        public event Action<Guid, EndPoint>? ClientConnected;
-        public event Action<Guid, EndPoint, SocketError>? ClientDisconnected;
-        public event Action<Guid, ReadOnlyMemory<byte>>? DataReceived;
+        // 운용 정보 제공
+        public int ConnectedCount => _clients.Count;
+        public (Guid Id, EndPoint? Remote)[] GetClientsSnapshot()
+            => _clients.Values.Select(c => (c.Id, c.RemoteEndPoint)).ToArray();
+
+        // 클라이언트 관리
+        private sealed class ClientContext(Socket socket)
+        {
+            public Guid Id { get; } = Guid.NewGuid();
+            public Socket Socket { get; } = socket ?? throw new ArgumentNullException(nameof(socket));
+            public EndPoint? RemoteEndPoint { get; } = socket.RemoteEndPoint;
+            public DateTime ConnectedAtUtc { get; } = DateTime.UtcNow;
+            public CancellationTokenSource Cts { get; } = new();
+            public SemaphoreSlim SendLock { get; } = new(1, 1);   // ← 추가
+        }
+
+        private readonly ConcurrentDictionary<Guid, ClientContext> _clients = new();
+
+        #region Events
+
+        public event EventHandler<DataReceivedEventArgs>? DataReceived;
+        public event EventHandler<ClientEventArgs>? ClientConnected;
+        public event EventHandler<ClientEventArgs>? ClientDisconnected;
+
+        private void RaiseDataReceived(ClientContext ctx, byte[] data)
+        {
+            try
+            {
+                DataReceived?.Invoke(this, new DataReceivedEventArgs(ctx.Id, ctx.RemoteEndPoint, data));
+            }
+            catch { /* ignore */ }
+        }
+
+        private void RaiseClientConnected(ClientContext ctx)
+        {
+            try { ClientConnected?.Invoke(this, new ClientEventArgs(ctx.Id, ctx.RemoteEndPoint)); } catch { }
+        }
+        private void RaiseClientDisconnected(ClientContext ctx)
+        {
+            try { ClientDisconnected?.Invoke(this, new ClientEventArgs(ctx.Id, ctx.RemoteEndPoint)); } catch { }
+        }
+
+        #endregion
+
+        #region Log
+
+        public Action<Exception, string>? LogError { get; init; }
+        private void Log(Exception ex, string msg)
+        {
+            try { LogError?.Invoke(ex, msg); } catch { }
+        }
+
+        #endregion
 
         private TcpServer(TcpServerOptions options)
         {
             _options = options ?? throw new ArgumentNullException(nameof(options));
+
+            ValidateOptions();
+        }
+
+        private void ValidateOptions()
+        {
+            if (_options.Port is < 1 or > 65535) throw new ArgumentOutOfRangeException(nameof(_options.Port));
+            if (_options.BackLog <= 0) throw new ArgumentOutOfRangeException(nameof(_options.BackLog));
+            if (_options.ReceiveBufferSize <= 0) throw new ArgumentOutOfRangeException(nameof(_options.ReceiveBufferSize));
+            if (_options.SendBufferSize <= 0) throw new ArgumentOutOfRangeException(nameof(_options.SendBufferSize));
+            if (_options.MaxClients <= 0) throw new ArgumentOutOfRangeException(nameof(_options.MaxClients));
         }
 
         internal static TcpServer CreateInternal(TcpServerOptions options)
             => new TcpServer(options);
 
-        internal void Dispose()
+        public void Dispose()
         {
             if (IsDisposed) return;
             IsDisposed = true;
 
-            // 수락 루프 취소
-            try { _acceptCts?.Cancel(); } catch { /* ignore */ }
+            try { StopAsync().GetAwaiter().GetResult(); } catch { }
+            try { _acceptCts?.Dispose(); } catch { }
+            try { _startStopLock?.Dispose(); } catch { }
 
-            // 리스너 소켓 교체 후 종료
-            var listener = Interlocked.Exchange(ref _listener, null);
-            if (listener is not null)
+            foreach (var kv in _clients)
             {
-                try
+                if (_clients.TryRemove(kv.Key, out var ctx))
                 {
-                    try { listener.Shutdown(SocketShutdown.Both); } catch { /* ignore */ }
-                    listener.Dispose();
+                    try { ctx.Cts.Cancel(); } catch { }
+                    try { ctx.Cts.Dispose(); } catch { }
+                    try { ctx.SendLock.Dispose(); } catch { }
+                    CloseSocketSafe(ctx.Socket);
                 }
-                catch { /* ignore */ }
             }
 
-            // 세션 전부 정리(강제)
-            foreach (var kv in _sessions)
-            {
-                try { kv.Value.DisposeHard(); } catch { /* ignore */ }
-            }
-            _sessions.Clear();
-
-            // 수락 태스크 합류 시도
-            try { _acceptTask?.Wait(TimeSpan.FromMilliseconds(100)); } catch { /* ignore */ }
-            _acceptTask = null;
-
-            // 세마포어 정리(클라이언트 패턴과 동일)
-            static void TryDisposeSemaphore(SemaphoreSlim sem)
-            {
-                try
-                {
-                    if (sem.Wait(0))
-                        sem.Dispose();
-                }
-                catch { /* ignore */ }
-            }
-            TryDisposeSemaphore(_startStopLock);
-
-            try { _acceptCts?.Dispose(); } catch { /* ignore */ }
-            _acceptCts = null;
+            GC.SuppressFinalize(this);
         }
 
         private void ThrowIfDisposed()
         {
-            if (!IsDisposed) return;
-            throw new ObjectDisposedException(nameof(TcpServer));
+            if (IsDisposed) throw new ObjectDisposedException(nameof(TcpServer));
         }
 
-        /// <summary>서버 시작</summary>
         public async Task StartAsync()
         {
             await _startStopLock.WaitAsync().ConfigureAwait(false);
@@ -118,18 +153,25 @@ namespace Communication.Tcp.Server
 
                 try
                 {
+                    // 빠른 재시작 허용
+                    sock.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+
+                    // 소켓을 지정된 IP 주소와 포트에 바인딩
                     sock.Bind(new IPEndPoint(_options.ListenAddress, _options.Port));
-                    sock.Listen(_options.Backlog);
+
+                    // 클라이언트 연결을 대기 시작
+                    sock.Listen(_options.BackLog);
+
+                    // 상태 저장 & Accept 루프 시작
+                    _listener = sock;
+                    _acceptCts = new CancellationTokenSource();
+                    _acceptTask = AcceptLoopAsync(_acceptCts.Token);
                 }
                 catch
                 {
                     try { sock.Dispose(); } catch { /* ignore */ }
                     throw;
                 }
-
-                _listener = sock;
-                _acceptCts = new CancellationTokenSource();
-                _acceptTask = Task.Run(() => AcceptLoopAsync(_acceptCts.Token));
             }
             finally
             {
@@ -137,357 +179,269 @@ namespace Communication.Tcp.Server
             }
         }
 
-        /// <summary>서버 정지(세션을 순차 종료하고 대기)</summary>
         public async Task StopAsync()
         {
             await _startStopLock.WaitAsync().ConfigureAwait(false);
             try
             {
-                if (_listener is null)
-                    return;
+                var listener = _listener;
+                if (listener is null)
+                    return; // 이미 중지됨
 
-                // 수락 중단
-                try { _acceptCts?.Cancel(); } catch { /* ignore */ }
+                // Accept 루프 취소
+                _acceptCts?.Cancel();
 
-                var listener = Interlocked.Exchange(ref _listener, null);
-                if (listener is not null)
-                {
-                    try
-                    {
-                        try { listener.Shutdown(SocketShutdown.Both); } catch { /* ignore */ }
-                        listener.Dispose();
-                    }
-                    catch { /* ignore */ }
-                }
+                // 리스너 닫기
+                CloseSocketSafe(listener);
+                _listener = null;
 
-                // 세션 순차 종료
-                var tasks = new Task[_sessions.Count];
-                int i = 0;
-                foreach (var kv in _sessions)
-                {
-                    tasks[i++] = kv.Value.CloseAsync(SocketError.Success);
-                }
-
-                var drain = Task.WhenAll(tasks);
-                var timeout = Task.Delay(_options.StopDrainTimeout);
-                await Task.WhenAny(drain, timeout).ConfigureAwait(false);
-
-                // 남은 건 강제 종료
-                foreach (var kv in _sessions)
-                {
-                    try { kv.Value.DisposeHard(); } catch { /* ignore */ }
-                }
-                _sessions.Clear();
-
-                // 수락 루프 합류
+                // Accept 루프 종료 대기
                 if (_acceptTask is not null)
                 {
-                    try { await _acceptTask.ConfigureAwait(false); } catch { /* ignore */ }
+                    try { await _acceptTask.ConfigureAwait(false); }
+                    catch { /* ignore */ }
                     _acceptTask = null;
+                }
+
+                // 모든 클라이언트 종료
+                foreach (var kv in _clients)
+                {
+                    if (_clients.TryRemove(kv.Key, out var ctx))
+                        CloseClient(ctx);
                 }
             }
             finally
             {
-                try { _acceptCts?.Dispose(); } catch { /* ignore */ }
-                _acceptCts = null;
-
                 _startStopLock.Release();
+                _acceptCts?.Dispose();
             }
         }
 
-        public int ConnectionCount => _sessions.Count;
-
-        public bool TryGetRemoteEndPoint(Guid clientId, out EndPoint? endPoint)
+        public bool Disconnect(Guid clientId)
         {
-            if (_sessions.TryGetValue(clientId, out var s))
+            if (_clients.TryRemove(clientId, out var ctx))
             {
-                try
-                {
-                    endPoint = s.Socket.RemoteEndPoint;
-                    return true;
-                }
-                catch { /* ignore */ }
+                CloseClient(ctx);
+                RaiseClientDisconnected(ctx);
+                return true;
             }
-
-            endPoint = null;
             return false;
         }
 
-        /// <summary>특정 클라이언트로 송신</summary>
-        public Task<bool> SendAsync(Guid clientId, ReadOnlyMemory<byte> buffer, CancellationToken ct = default)
+        public async Task<bool> SendAsync(Guid clientId, ReadOnlyMemory<byte> data, CancellationToken ct = default)
         {
-            if (buffer.Length == 0) return Task.FromResult(true);
-            if (!_sessions.TryGetValue(clientId, out var s)) return Task.FromResult(false);
-            return s.SendAsync(buffer, ct);
-        }
+            if (data.Length == 0) return true;
+            if (!_clients.TryGetValue(clientId, out var ctx)) return false;
 
-        /// <summary>브로드캐스트(성공한 세션 수 반환)</summary>
-        public async Task<int> BroadcastAsync(ReadOnlyMemory<byte> buffer, CancellationToken ct = default)
-        {
-            int ok = 0;
-            foreach (var kv in _sessions)
-            {
-                if (await kv.Value.SendAsync(buffer, ct).ConfigureAwait(false))
-                    ok++;
-            }
-            return ok;
-        }
+            // 연결 CTS와 호출자 CT를 링크해서 CloseClient의 Cancel을 즉시 반영
+            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, ctx.Cts.Token);
+            var token = linkedCts.Token;
 
-        /// <summary>강제 연결 해제</summary>
-        public Task<bool> DisconnectAsync(Guid clientId, SocketError reason = SocketError.ConnectionAborted)
-        {
-            if (!_sessions.TryGetValue(clientId, out var s)) return Task.FromResult(false);
-            return s.CloseAsync(reason).ContinueWith(_ => true);
-        }
-
-        private async Task AcceptLoopAsync(CancellationToken ct)
-        {
-            var listener = _listener!;
-            while (!ct.IsCancellationRequested)
-            {
-                Socket? socket = null;
-                try
-                {
-                    socket = await listener.AcceptAsync(ct).ConfigureAwait(false);
-
-                    if (_sessions.Count >= _options.MaxConnections)
-                    {
-                        try { socket.Close(); } catch { /* ignore */ }
-                        continue;
-                    }
-
-                    ConfigureAcceptedSocket(socket);
-
-                    var session = new ClientSession(this, socket, _options);
-                    if (_sessions.TryAdd(session.Id, session))
-                    {
-                        try { ClientConnected?.Invoke(session.Id, socket.RemoteEndPoint!); } catch { /* ignore */ }
-                        _ = session.RunReceiveLoopAsync(); // fire-and-forget
-                    }
-                    else
-                    {
-                        await session.CloseAsync(SocketError.AccessDenied).ConfigureAwait(false);
-                    }
-                }
-                catch (OperationCanceledException) { break; }
-                catch (ObjectDisposedException) { break; }
-                catch
-                {
-                    try { socket?.Dispose(); } catch { /* ignore */ }
-                    // 계속 루프
-                }
-            }
-        }
-
-        private void ConfigureAcceptedSocket(Socket socket)
-        {
+            await ctx.SendLock.WaitAsync(token).ConfigureAwait(false);
             try
             {
-                socket.NoDelay = _options.NoDelay;
-                socket.ReceiveBufferSize = _options.ReceiveBufferSize;
-                socket.SendBufferSize = _options.SendBufferSize;
-            }
-            catch { /* ignore */ }
-        }
-
-        private void OnSessionClosed(ClientSession session, SocketError reason)
-        {
-            _sessions.TryRemove(session.Id, out _);
-            try { ClientDisconnected?.Invoke(session.Id, session.RemoteEndPoint, reason); } catch { /* ignore */ }
-        }
-
-        internal void OnSessionData(Guid id, ReadOnlyMemory<byte> data)
-        {
-            try { DataReceived?.Invoke(id, data); } catch { /* ignore */ }
-        }
-
-        // ===========================
-        // Per-connection session
-        // ===========================
-        private sealed class ClientSession
-        {
-            private readonly TcpServer _owner;
-            private readonly TcpServerOptions _opts;
-            private readonly ArrayPool<byte> _pool = ArrayPool<byte>.Shared;
-
-            private readonly SemaphoreSlim _sendLock = new(1, 1);
-
-            private volatile bool _closing;
-
-            public Guid Id { get; } = Guid.NewGuid();
-            public Socket Socket { get; }
-            public EndPoint RemoteEndPoint => Socket.RemoteEndPoint!;
-
-            public ClientSession(TcpServer owner, Socket socket, TcpServerOptions options)
-            {
-                _owner = owner;
-                Socket = socket;
-                _opts = options;
-            }
-
-            [MethodImpl(MethodImplOptions.AggressiveInlining)]
-            private static int ReadInt32BE(ReadOnlySpan<byte> span)
-            {
-                return (span[0] << 24) | (span[1] << 16) | (span[2] << 8) | span[3];
-            }
-
-            public async Task RunReceiveLoopAsync()
-            {
-                SocketError closeReason = SocketError.Success;
-
-                if (!_opts.UseLengthPrefixFraming)
+                var sock = ctx.Socket;
+                int offset = 0;
+                while (offset < data.Length)
                 {
-                    var buffer = _pool.Rent(_opts.ReceiveBufferSize);
-                    try
-                    {
-                        while (true)
-                        {
-                            int received = await Socket.ReceiveAsync(buffer, SocketFlags.None).ConfigureAwait(false);
-                            if (received == 0) { closeReason = SocketError.ConnectionReset; break; }
-                            _owner.OnSessionData(Id, new ReadOnlyMemory<byte>(buffer, 0, received));
-                        }
-                    }
-                    catch (SocketException se) { closeReason = se.SocketErrorCode; }
-                    catch (ObjectDisposedException) { closeReason = SocketError.OperationAborted; }
-                    catch { closeReason = SocketError.SocketError; }
-                    finally
-                    {
-                        _pool.Return(buffer);
-                        await CloseAsync(closeReason).ConfigureAwait(false);
-                    }
-                }
-                else
-                {
-                    byte[] header = _pool.Rent(4);
-                    byte[] payload = Array.Empty<byte>();
-
-                    try
-                    {
-                        while (true)
-                        {
-                            if (!await ReceiveExactAsync(header, 4).ConfigureAwait(false))
-                            { closeReason = SocketError.ConnectionReset; break; }
-
-                            int len = ReadInt32BE(header);
-                            if (len < 0 || len > _opts.MaxFrameLength)
-                            { closeReason = SocketError.MessageSize; break; }
-
-                            if (payload.Length < len)
-                                payload = new byte[len];
-
-                            if (!await ReceiveExactAsync(payload, len).ConfigureAwait(false))
-                            { closeReason = SocketError.ConnectionReset; break; }
-
-                            _owner.OnSessionData(Id, new ReadOnlyMemory<byte>(payload, 0, len));
-                        }
-                    }
-                    catch (SocketException se) { closeReason = se.SocketErrorCode; }
-                    catch (ObjectDisposedException) { closeReason = SocketError.OperationAborted; }
-                    catch { closeReason = SocketError.SocketError; }
-                    finally
-                    {
-                        _pool.Return(header);
-                        await CloseAsync(closeReason).ConfigureAwait(false);
-                    }
-                }
-            }
-
-            private async Task<bool> ReceiveExactAsync(byte[] buffer, int size)
-            {
-                int off = 0;
-                while (off < size)
-                {
-                    int n = await Socket.ReceiveAsync(buffer.AsMemory(off, size - off), SocketFlags.None).ConfigureAwait(false);
-                    if (n == 0) return false;
-                    off += n;
+                    int sent = await sock.SendAsync(data.Slice(offset), SocketFlags.None, token).ConfigureAwait(false);
+                    if (sent <= 0) throw new SocketException((int)SocketError.ConnectionReset);
+                    offset += sent;
                 }
                 return true;
             }
-
-            public async Task<bool> SendAsync(ReadOnlyMemory<byte> buffer, CancellationToken ct)
+            catch (SocketException ex)
             {
-                if (_closing) return false;
-                await _sendLock.WaitAsync(ct).ConfigureAwait(false);
+                Log(ex, $"Send socket error ({ex.SocketErrorCode})");
+                try { ctx.Cts.Cancel(); } catch { }
+                return false;
+            }
+            catch (OperationCanceledException)
+            {
+                // CloseClient에서 Cancel되었거나 외부 CT 취소
+                return false;
+            }
+            catch (Exception ex)
+            {
+                Log(ex, "Send unexpected");
+                try { ctx.Cts.Cancel(); } catch { }
+                return false;
+            }
+            finally
+            {
+                ctx.SendLock.Release();
+            }
+        }
+
+        public async Task<int> BroadcastAsync(ReadOnlyMemory<byte> data, CancellationToken ct = default)
+        {
+            if (data.Length == 0) return 0;
+
+            var targets = _clients.Values.ToArray(); // snapshot
+            var tasks = new Task<bool>[targets.Length];
+            for (int i = 0; i < targets.Length; i++)
+                tasks[i] = SendAsync(targets[i].Id, data, ct);
+
+            var results = await Task.WhenAll(tasks).ConfigureAwait(false);
+            return results.Count(r => r);
+        }
+
+        private async Task AcceptLoopAsync(CancellationToken token)
+        {
+            var listener = _listener!;
+            while (!token.IsCancellationRequested)
+            {
+                Socket clientSock;
                 try
                 {
-                    if (!Socket.Connected) return false;
-
-                    if (_opts.UseLengthPrefixFraming)
+                    // 최대 클라이언트 수 제한
+                    if (_clients.Count >= _options.MaxClients)
                     {
-                        int len = buffer.Length;
-                        var hdr = new byte[4];              // <-- byte[] 사용
-                        hdr[0] = (byte)((len >> 24) & 0xFF);
-                        hdr[1] = (byte)((len >> 16) & 0xFF);
-                        hdr[2] = (byte)((len >> 8) & 0xFF);
-                        hdr[3] = (byte)(len & 0xFF);
-
-                        await SendAllAsync(hdr, ct).ConfigureAwait(false);   // ReadOnlyMemory 오버로드 호출
-                        await SendAllAsync(buffer, ct).ConfigureAwait(false);
-                        return true;
+                        await Task.Delay(100, token).ConfigureAwait(false); // backoff
+                        continue;
                     }
-                    else
+
+                    clientSock = await listener.AcceptAsync(token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException ex)
+                {
+                    Log(ex, $"AcceptLoop: {ex.Message}");
+                    break;
+                }
+                catch (ObjectDisposedException ex)
+                {
+                    Log(ex, $"AcceptLoop: {ex.Message}");
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    Log(ex, "AcceptLoop: unexpected exception");
+
+                    // 딜레이를 줘서 Busy waiting 방지
+                    await Task.Delay(100, token).ConfigureAwait(false);
+                    continue;
+                }
+
+                try
+                {
+                    // TCP KeepAlive 활성화
+                    clientSock.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+
+                    clientSock.NoDelay = _options.NoDelay;
+                    clientSock.ReceiveBufferSize = _options.ReceiveBufferSize;
+                    clientSock.SendBufferSize = _options.SendBufferSize;
+
+                    var ctx = new ClientContext(clientSock);
+
+                    if (!_clients.TryAdd(ctx.Id, ctx))
                     {
-                        await SendAllAsync(buffer, ct).ConfigureAwait(false);
-                        return true;
+                        // 등록 실패 시 바로 닫기
+                        CloseSocketSafe(clientSock);
+                        continue;
                     }
-                }
-                catch
-                {
-                    return false;
-                }
-                finally
-                {
-                    _sendLock.Release();
-                }
-            }
-            
-            private async ValueTask SendAllAsync(ReadOnlyMemory<byte> data, CancellationToken ct)
-            {
-                int sent = 0;
-                while (sent < data.Length)
-                {
-                    int n = await Socket.SendAsync(data.Slice(sent), SocketFlags.None, ct).ConfigureAwait(false);
-                    if (n == 0) throw new SocketException((int)SocketError.ConnectionReset);
-                    sent += n;
-                }
-            }
 
-            public async Task CloseAsync(SocketError reason)
-            {
-                if (_closing) return;
-                _closing = true;
-
-                try
-                {
-                    try { Socket.Shutdown(SocketShutdown.Both); } catch { /* ignore */ }
-                    try { Socket.Close(); } catch { /* ignore */ }
+                    RaiseClientConnected(ctx);
+                    _ = HandleClientAsync(ctx, token);
                 }
-                finally
+                catch (Exception ex)
                 {
-                    try { Socket.Dispose(); } catch { /* ignore */ }
-                    _owner.OnSessionClosed(this, reason);
-
-                    // sendLock 해제 보장
-                    try { await _sendLock.WaitAsync(0).ConfigureAwait(false); } catch { /* ignore */ }
-                    _sendLock.Dispose();
-                }
-            }
-
-            /// <summary>Stop 타임아웃 경과 등에서 마지막 강제 종료용</summary>
-            public void DisposeHard()
-            {
-                try
-                {
-                    try { Socket.Shutdown(SocketShutdown.Both); } catch { /* ignore */ }
-                    Socket.Dispose();
-                }
-                catch { /* ignore */ }
-                finally
-                {
-                    _owner.OnSessionClosed(this, SocketError.OperationAborted);
-                    try { _sendLock.Dispose(); } catch { /* ignore */ }
+                    CloseSocketSafe(clientSock);
                 }
             }
         }
+
+        private async Task HandleClientAsync(ClientContext ctx, CancellationToken serverToken)
+        {
+            var sock = ctx.Socket;
+            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(serverToken, ctx.Cts.Token);
+            var token = linkedCts.Token;
+
+            // 고정 크기 버퍼(풀링/파이프 등은 필요 시 확장)
+            var buffer = new byte[_options.ReceiveBufferSize > 0 ? Math.Min(_options.ReceiveBufferSize, 128 * 1024) : 8192];
+            if (buffer.Length == 0) buffer = new byte[8192];
+
+            try
+            {
+                while (!token.IsCancellationRequested)
+                {
+                    int received = await sock.ReceiveAsync(buffer, SocketFlags.None, token).ConfigureAwait(false);
+                    if (received <= 0) break;
+
+                    // 이벤트로 전달할 때는 메시지 수명 문제 방지를 위해 복사본 사용
+                    var copy = new byte[received];
+                    Buffer.BlockCopy(buffer, 0, copy, 0, received);
+
+                    RaiseDataReceived(ctx, copy);
+                }
+            }
+            catch (OperationCanceledException) { /* 정상 취소 */ }
+            catch (ObjectDisposedException) { /* 소켓 종료 */ }
+            catch (SocketException ex)
+            {
+                Log(ex, $"Receive socket error ({ex.SocketErrorCode})");
+            }
+            catch (Exception ex)
+            {
+                Log(ex, "Receive unexpected");
+            }
+            finally
+            {
+                // 딕셔너리에서 제거 & 연결 종료 알림
+                if (_clients.TryRemove(ctx.Id, out _))
+                {
+                    CloseClient(ctx);
+                    RaiseClientDisconnected(ctx);
+                }
+            }
+        }
+
+        private void CloseClient(ClientContext ctx)
+        {
+            // 모든 작업 취소 신호
+            try { ctx.Cts.Cancel(); } catch { }
+
+            // 보내기 임계구역이 끝나길 잠깐 기다렸다가(최대 1초) 락 확보 후 Dispose
+            // - 확보 실패 시 Dispose 생략 (레이스 방지 우선)
+            bool sendLockAcquired = false;
+            try
+            {
+                sendLockAcquired = ctx.SendLock.Wait(TimeSpan.FromSeconds(1));
+            }
+            catch { /* ignore */ }
+            finally
+            {
+                if (sendLockAcquired)
+                {
+                    try { ctx.SendLock.Dispose(); } catch { }
+                }
+                // 확보 실패 시 Dispose 하지 않음
+            }
+
+            // 소켓 종료
+            CloseSocketSafe(ctx.Socket);
+
+            // CTS 정리
+            try { ctx.Cts.Dispose(); } catch { }
+        }
+
+        private static void CloseSocketSafe(Socket? s)
+        {
+            if (s == null) return;
+            try { s.Shutdown(SocketShutdown.Both); } catch { /* ignore */ }
+            try { s.Dispose(); } catch { /* ignore */ }
+        }
+    }
+
+    public sealed class ClientEventArgs(Guid clientId, EndPoint? remoteEndPoint) : EventArgs
+    {
+        public Guid ClientId { get; } = clientId;
+        public EndPoint? RemoteEndPoint { get; } = remoteEndPoint;
+    }
+
+    public sealed class DataReceivedEventArgs(Guid clientId, EndPoint? remoteEndPoint, byte[] data) : EventArgs
+    {
+        public Guid ClientId { get; } = clientId;
+        public EndPoint? RemoteEndPoint { get; } = remoteEndPoint;
+        public byte[] Data { get; } = data ?? [];
     }
 }

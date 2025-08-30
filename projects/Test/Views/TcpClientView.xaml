@@ -11,19 +11,22 @@
     mc:Ignorable="d">
     <Grid>
         <Button
-            Width="90"
-            Height="41"
-            Margin="38,32,0,0"
+            Margin="54,36,0,0"
+            HorizontalAlignment="Left"
+            VerticalAlignment="Top"
+            Command="{Binding ServerStartCommand}"
+            Content="서버 시작" />
+        <Button
+            Margin="589,41,0,0"
             HorizontalAlignment="Left"
             VerticalAlignment="Top"
             Command="{Binding ClientStartCommand}"
-            Content="Client 시작" />
+            Content="클라이언트 연결" />
         <Button
-            Width="90"
-            Height="41"
-            Margin="167,32,0,0"
+            Margin="601,95,0,0"
             HorizontalAlignment="Left"
             VerticalAlignment="Top"
-            Content="Client 중지" />
+            Command="{Binding ClientSendDataCommand}"
+            Content="데이터 전송" />
     </Grid>
 </Window>
