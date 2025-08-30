@@ -1,13 +1,7 @@
-﻿using System;
-using System.Buffers;
+﻿using System.Buffers;
 using System.Collections.Concurrent;
-using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
-using System.Runtime.CompilerServices;
-using System.Threading;
-using System.Threading.Tasks;
-using System.Linq;
 
 namespace Communication.Tcp.Server
 {
@@ -17,7 +11,7 @@ namespace Communication.Tcp.Server
     /// </summary>
     public sealed class TcpServer
     {
-        public bool IsDisposed { get; private set; } = false;
+        public bool IsDisposed { get; private set; }
 
         public readonly Guid Guid = Guid.NewGuid();
 
@@ -76,7 +70,7 @@ namespace Communication.Tcp.Server
             {
                 var client = ToPublicClient(ctx);
                 ClientConnected?.Invoke(this, new ClientEventArgs(client));
-            } catch { }
+            } catch { /* ignored */ }
         }
         private void RaiseClientDisconnected(ClientContext ctx)
         {
@@ -84,7 +78,7 @@ namespace Communication.Tcp.Server
             {
                 var client = ToPublicClient(ctx);
                 ClientDisconnected?.Invoke(this, new ClientEventArgs(client));
-            } catch { }
+            } catch { /* ignored */ }
         }
 
         #endregion
@@ -94,7 +88,7 @@ namespace Communication.Tcp.Server
         public Action<Exception, string>? LogError { get; init; }
         private void Log(Exception ex, string msg)
         {
-            try { LogError?.Invoke(ex, msg); } catch { }
+            try { LogError?.Invoke(ex, msg); } catch { /* ignored */ }
         }
 
         #endregion
@@ -123,17 +117,17 @@ namespace Communication.Tcp.Server
             if (IsDisposed) return;
             IsDisposed = true;
 
-            try { StopAsync().GetAwaiter().GetResult(); } catch { }
-            try { _acceptCts?.Dispose(); } catch { }
-            try { _startStopLock?.Dispose(); } catch { }
+            try { StopAsync().GetAwaiter().GetResult(); } catch { /* ignored */ }
+            try { _acceptCts?.Dispose(); } catch { /* ignored */ }
+            try { _startStopLock.Dispose(); } catch { /* ignored */ }
 
             foreach (var kv in _clients)
             {
                 if (_clients.TryRemove(kv.Key, out var ctx))
                 {
-                    try { ctx.Cts.Cancel(); } catch { }
-                    try { ctx.Cts.Dispose(); } catch { }
-                    try { ctx.SendLock.Dispose(); } catch { }
+                    try { ctx.Cts.Cancel(); } catch { /* ignored */ }
+                    try { ctx.Cts.Dispose(); } catch { /* ignored */ }
+                    try { ctx.SendLock.Dispose(); } catch { /* ignored */ }
                     CloseSocketSafe(ctx.Socket);
                 }
             }
@@ -265,7 +259,7 @@ namespace Communication.Tcp.Server
             catch (SocketException ex)
             {
                 Log(ex, $"Send socket error ({ex.SocketErrorCode})");
-                try { ctx.Cts.Cancel(); } catch { }
+                try { ctx.Cts.Cancel(); } catch { /* ignored */ }
                 return false;
             }
             catch (OperationCanceledException)
@@ -276,7 +270,7 @@ namespace Communication.Tcp.Server
             catch (Exception ex)
             {
                 Log(ex, "Send unexpected");
-                try { ctx.Cts.Cancel(); } catch { }
+                try { ctx.Cts.Cancel(); } catch { /* ignored */ }
                 return false;
             }
             finally
@@ -357,6 +351,8 @@ namespace Communication.Tcp.Server
                 }
                 catch (Exception ex)
                 {
+                    Log(ex, "AcceptLoop: unexpected exception");
+
                     CloseSocketSafe(clientSock);
                 }
             }
@@ -410,7 +406,7 @@ namespace Communication.Tcp.Server
         private void CloseClient(ClientContext ctx)
         {
             // 모든 작업 취소 신호
-            try { ctx.Cts.Cancel(); } catch { }
+            try { ctx.Cts.Cancel(); } catch { /* ignored */ }
 
             // 보내기 임계구역이 끝나길 잠깐 기다렸다가(최대 1초) 락 확보 후 Dispose
             // - 확보 실패 시 Dispose 생략 (레이스 방지 우선)
@@ -424,7 +420,7 @@ namespace Communication.Tcp.Server
             {
                 if (sendLockAcquired)
                 {
-                    try { ctx.SendLock.Dispose(); } catch { }
+                    try { ctx.SendLock.Dispose(); } catch { /* ignored */ }
                 }
                 // 확보 실패 시 Dispose 하지 않음
             }
@@ -433,7 +429,7 @@ namespace Communication.Tcp.Server
             CloseSocketSafe(ctx.Socket);
 
             // CTS 정리
-            try { ctx.Cts.Dispose(); } catch { }
+            try { ctx.Cts.Dispose(); } catch { /* ignored */ }
         }
 
         private static void CloseSocketSafe(Socket? s)
@@ -455,12 +451,10 @@ namespace Communication.Tcp.Server
         internal DataReceivedEventArgs(TcpClientConnection client, byte[] data)
         {
             Client = client;
-            Data = data ?? [];
+            Data = data;
         }
 
         public TcpClientConnection Client { get; }
-        public Guid ClientId => Client.Id;                         // 하위호환
-        public EndPoint? RemoteEndPoint => Client.RemoteEndPoint;  // 하위호환
         public byte[] Data { get; }
 
         // 편의 메서드: 바로 응답

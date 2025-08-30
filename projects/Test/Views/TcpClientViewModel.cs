@@ -28,8 +28,7 @@ namespace Test.Views
 
         public ICommand ClientSendDataCommand => new DelegateCommand(() =>
         {
-            List<byte> data = new List<byte>();
-            data.Add(40);
+            var data = new List<byte> { 40 };
             _ = _client?.SendAsync(data.ToArray());
         });
 
