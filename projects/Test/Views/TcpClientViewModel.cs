@@ -10,13 +10,6 @@ namespace Test.Views
 {
     public class TcpClientViewModel : BindableBase
     {
-        private string _title = string.Empty;
-        public string Title
-        {
-            get => _title;
-            set => SetProperty(ref _title, value);
-        }
-
         private TcpClient? _client;
 
         public ICommand ClientStartCommand => new DelegateCommand(() =>
@@ -36,9 +29,9 @@ namespace Test.Views
         {
             var options = new TcpServerOptions(IPAddress.Parse("0.0.0.0"), 10000);
             var server = TcpServerManager.Create(options);
-            server.DataReceived += (sender, args) =>
+            server.DataReceived += (context) =>
             {
-                Debug.WriteLine($"수신받은 데이터: {args.Data[0]}");
+                Debug.WriteLine($"수신받은 데이터: {context.Data[0]}");
             };
             _ = server.StartAsync();
         });

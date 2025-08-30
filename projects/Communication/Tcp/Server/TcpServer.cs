@@ -31,54 +31,20 @@ namespace Communication.Tcp.Server
         public (Guid Id, EndPoint? Remote)[] GetClientsSnapshot()
             => _clients.Values.Select(c => (c.Id, c.RemoteEndPoint)).ToArray();
 
-        // 클라이언트 관리
-        private sealed class ClientContext(Socket socket)
-        {
-            public Guid Id { get; } = Guid.NewGuid();
-            public Socket Socket { get; } = socket ?? throw new ArgumentNullException(nameof(socket));
-            public EndPoint? RemoteEndPoint { get; } = socket.RemoteEndPoint;
-            public DateTime ConnectedAtUtc { get; } = DateTime.UtcNow;
-            public CancellationTokenSource Cts { get; } = new();
-            public SemaphoreSlim SendLock { get; } = new(1, 1);   // ← 추가
-        }
-
-        private readonly ConcurrentDictionary<Guid, ClientContext> _clients = new();
+        private readonly ConcurrentDictionary<Guid, TcpClientContext> _clients = new();
 
         #region Events
 
-        private TcpClientConnection ToPublicClient(ClientContext ctx)
-            => new TcpClientConnection(this, ctx.Id, ctx.RemoteEndPoint, ctx.ConnectedAtUtc);
+        public event TcpDataReceivedEventHandler? DataReceived;
 
-        public event EventHandler<DataReceivedEventArgs>? DataReceived;
-        public event EventHandler<ClientEventArgs>? ClientConnected;
-        public event EventHandler<ClientEventArgs>? ClientDisconnected;
-
-        private void RaiseDataReceived(ClientContext ctx, byte[] data)
+        private void RaiseDataReceived(TcpClientContext ctx, byte[] data)
         {
             try
             {
-                var client = ToPublicClient(ctx);
-                DataReceived?.Invoke(this, new DataReceivedEventArgs(client, data));
+                var dataCtx = new TcpDataReceivedContext(this, ctx.Id, data);
+                DataReceived?.Invoke(dataCtx);
             }
             catch { /* ignore */ }
-        }
-
-        private void RaiseClientConnected(ClientContext ctx)
-        {
-            try
-            {
-                var client = ToPublicClient(ctx);
-                ClientConnected?.Invoke(this, new ClientEventArgs(client));
-            } catch { /* ignored */ }
-        }
-
-        private void RaiseClientDisconnected(ClientContext ctx)
-        {
-            try
-            {
-                var client = ToPublicClient(ctx);
-                ClientDisconnected?.Invoke(this, new ClientEventArgs(client));
-            } catch { /* ignored */ }
         }
 
         #endregion
@@ -112,7 +78,7 @@ namespace Communication.Tcp.Server
         internal static TcpServer CreateInternal(TcpServerOptions options)
             => new TcpServer(options);
 
-        public void Dispose()
+        internal void Dispose()
         {
             if (IsDisposed) return;
             IsDisposed = true;
@@ -226,7 +192,6 @@ namespace Communication.Tcp.Server
             if (_clients.TryRemove(clientId, out var ctx))
             {
                 CloseClient(ctx);
-                RaiseClientDisconnected(ctx);
                 return true;
             }
             return false;
@@ -335,7 +300,7 @@ namespace Communication.Tcp.Server
                     clientSock.ReceiveBufferSize = _options.ReceiveBufferSize;
                     clientSock.SendBufferSize = _options.SendBufferSize;
 
-                    var ctx = new ClientContext(clientSock);
+                    var ctx = new TcpClientContext(clientSock);
 
                     if (!_clients.TryAdd(ctx.Id, ctx))
                     {
@@ -344,7 +309,6 @@ namespace Communication.Tcp.Server
                         continue;
                     }
 
-                    RaiseClientConnected(ctx);
                     _ = HandleClientAsync(ctx, token);
                 }
                 catch (Exception ex)
@@ -356,7 +320,7 @@ namespace Communication.Tcp.Server
             }
         }
 
-        private async Task HandleClientAsync(ClientContext ctx, CancellationToken serverToken)
+        private async Task HandleClientAsync(TcpClientContext ctx, CancellationToken serverToken)
         {
             var sock = ctx.Socket;
             using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(serverToken, ctx.Cts.Token);
@@ -396,12 +360,11 @@ namespace Communication.Tcp.Server
                 if (_clients.TryRemove(ctx.Id, out _))
                 {
                     CloseClient(ctx);
-                    RaiseClientDisconnected(ctx);
                 }
             }
         }
 
-        private void CloseClient(ClientContext ctx)
+        private void CloseClient(TcpClientContext ctx)
         {
             // 모든 작업 취소 신호
             try { ctx.Cts.Cancel(); } catch { /* ignored */ }
@@ -438,25 +401,4 @@ namespace Communication.Tcp.Server
         }
     }
 
-    public sealed class ClientEventArgs(TcpClientConnection client) : EventArgs
-    {
-        public Guid ClientId { get; } = client.Id;
-        public EndPoint? RemoteEndPoint { get; } = client.RemoteEndPoint;
-    }
-
-    public sealed class DataReceivedEventArgs : EventArgs
-    {
-        internal DataReceivedEventArgs(TcpClientConnection client, byte[] data)
-        {
-            Client = client;
-            Data = data;
-        }
-
-        public TcpClientConnection Client { get; }
-        public byte[] Data { get; }
-
-        // 편의 메서드: 바로 응답
-        public Task<bool> ReplyAsync(ReadOnlyMemory<byte> data, CancellationToken ct = default)
-            => Client.SendAsync(data, ct);
-    }
 }
