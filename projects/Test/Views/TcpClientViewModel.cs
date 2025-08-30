@@ -5,7 +5,6 @@ using System.Runtime.CompilerServices;
 using System.Windows.Input;
 using Communication.Tcp.Client;
 using Communication.Tcp.Server;
-using DataReceivedEventArgs = Communication.Tcp.Server.DataReceivedEventArgs;
 
 namespace Test.Views
 {
@@ -18,7 +17,7 @@ namespace Test.Views
             set => SetProperty(ref _title, value);
         }
 
-        private TcpClient _client;
+        private TcpClient? _client;
 
         public ICommand ClientStartCommand => new DelegateCommand(() =>
         {
@@ -31,20 +30,18 @@ namespace Test.Views
         {
             List<byte> data = new List<byte>();
             data.Add(40);
-            _ = _client.SendAsync(data.ToArray());
+            _ = _client?.SendAsync(data.ToArray());
         });
 
         public ICommand ServerStartCommand => new DelegateCommand(() =>
         {
             var options = new TcpServerOptions(IPAddress.Parse("0.0.0.0"), 10000);
             var server = TcpServerManager.Create(options);
-            server.DataReceived += Server_DataReceived;
+            server.DataReceived += (sender, args) =>
+            {
+                Debug.WriteLine($"수신받은 데이터: {args.Data[0]}");
+            };
             _ = server.StartAsync();
         });
-
-        private void Server_DataReceived(object? sender, DataReceivedEventArgs e)
-        {
-            Debug.WriteLine($"수신받은 데이터: {e.Data[0]}");
-        }
     }
 }

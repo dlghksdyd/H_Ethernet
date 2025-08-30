@@ -53,6 +53,9 @@ namespace Communication.Tcp.Server
 
         #region Events
 
+        private TcpClientConnection ToPublicClient(ClientContext ctx)
+            => new TcpClientConnection(this, ctx.Id, ctx.RemoteEndPoint, ctx.ConnectedAtUtc);
+
         public event EventHandler<DataReceivedEventArgs>? DataReceived;
         public event EventHandler<ClientEventArgs>? ClientConnected;
         public event EventHandler<ClientEventArgs>? ClientDisconnected;
@@ -61,18 +64,27 @@ namespace Communication.Tcp.Server
         {
             try
             {
-                DataReceived?.Invoke(this, new DataReceivedEventArgs(ctx.Id, ctx.RemoteEndPoint, data));
+                var client = ToPublicClient(ctx);
+                DataReceived?.Invoke(this, new DataReceivedEventArgs(client, data));
             }
             catch { /* ignore */ }
         }
 
         private void RaiseClientConnected(ClientContext ctx)
         {
-            try { ClientConnected?.Invoke(this, new ClientEventArgs(ctx.Id, ctx.RemoteEndPoint)); } catch { }
+            try
+            {
+                var client = ToPublicClient(ctx);
+                ClientConnected?.Invoke(this, new ClientEventArgs(client));
+            } catch { }
         }
         private void RaiseClientDisconnected(ClientContext ctx)
         {
-            try { ClientDisconnected?.Invoke(this, new ClientEventArgs(ctx.Id, ctx.RemoteEndPoint)); } catch { }
+            try
+            {
+                var client = ToPublicClient(ctx);
+                ClientDisconnected?.Invoke(this, new ClientEventArgs(client));
+            } catch { }
         }
 
         #endregion
@@ -432,16 +444,27 @@ namespace Communication.Tcp.Server
         }
     }
 
-    public sealed class ClientEventArgs(Guid clientId, EndPoint? remoteEndPoint) : EventArgs
+    public sealed class ClientEventArgs(TcpClientConnection client) : EventArgs
     {
-        public Guid ClientId { get; } = clientId;
-        public EndPoint? RemoteEndPoint { get; } = remoteEndPoint;
+        public Guid ClientId { get; } = client.Id;
+        public EndPoint? RemoteEndPoint { get; } = client.RemoteEndPoint;
     }
 
-    public sealed class DataReceivedEventArgs(Guid clientId, EndPoint? remoteEndPoint, byte[] data) : EventArgs
+    public sealed class DataReceivedEventArgs : EventArgs
     {
-        public Guid ClientId { get; } = clientId;
-        public EndPoint? RemoteEndPoint { get; } = remoteEndPoint;
-        public byte[] Data { get; } = data ?? [];
+        internal DataReceivedEventArgs(TcpClientConnection client, byte[] data)
+        {
+            Client = client;
+            Data = data ?? [];
+        }
+
+        public TcpClientConnection Client { get; }
+        public Guid ClientId => Client.Id;                         // 하위호환
+        public EndPoint? RemoteEndPoint => Client.RemoteEndPoint;  // 하위호환
+        public byte[] Data { get; }
+
+        // 편의 메서드: 바로 응답
+        public Task<bool> ReplyAsync(ReadOnlyMemory<byte> data, CancellationToken ct = default)
+            => Client.SendAsync(data, ct);
     }
 }
